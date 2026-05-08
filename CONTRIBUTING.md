@@ -14,6 +14,9 @@ adding new lessons or improving existing ones.
    ```
 
 2. **Edit** the relevant `.md` file. Follow [STYLE.md](./STYLE.md).
+   When writing a lesson from scratch, copy the skeleton from
+   [LESSON-TEMPLATE.md](./LESSON-TEMPLATE.md) — it captures the canonical
+   structure (opening paragraph → H2 body sections → Common Pitfalls → Summary).
 
 3. **Commit** with a clear message — see [commit conventions](#commit-conventions) below.
 

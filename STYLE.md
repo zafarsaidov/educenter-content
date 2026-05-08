@@ -24,6 +24,22 @@ This H1 should match the lesson's title in the platform.
 
 ❌ Don't use multiple H1s. Don't put the H1 lower in the file.
 
+### Recommended section flow
+Every lesson follows the same skeleton — see [`LESSON-TEMPLATE.md`](./LESSON-TEMPLATE.md)
+for a copy-paste starting point. The canonical structure:
+
+1. **H1 title** (one line, matches the platform's `Theme.title`).
+2. **Opening paragraph** — 2–4 sentences: what / why / what-the-student-can-do.
+3. **Body H2 sections** — focused topics, each grouping its sub-cases under H3s.
+4. **Key Concepts** (optional) — glossary of newly-introduced terms.
+5. **Workflow / Visual Overview** (optional) — ASCII diagram showing relationships.
+6. **Common Pitfalls** — 3–6 bullets of `mistake — why it's wrong`.
+7. **Summary** — 3–6 takeaway bullets.
+
+Sections (1), (2), (3) and (7) are mandatory. The rest are situational. Aim for
+~100–150 lines / 6–9 KB total — long enough to stand alone as a reference, short
+enough to skim before a related video.
+
 ### No frontmatter
 The platform database owns metadata (title, order, duration, video status, slug).
 Don't add a YAML or JSON frontmatter block at the top of lesson files. Start with the
@@ -70,15 +86,19 @@ File names, flags, environment variables, and short commands go in single backti
 
 ## Language
 
-### Bilingual prose, English code
-The platform's primary student base reads Uzbek for explanations but encounters
-English-language commands and Linux/DevOps terminology. Match that:
+### Prose language
+This repository is written in **English** — that's the canonical language for code
+samples, command output, and the lesson notes themselves. The platform's AI tutor
+auto-detects the student's question language at runtime and replies in Uzbek, English,
+or any code-mix the student writes — it does NOT need the source notes to be Uzbek.
+Keeping notes in English means a single source of truth that stays consistent across
+courses.
 
-- **Prose:** Uzbek (or English — whichever the course's native language is).
+If a future course needs Uzbek prose for pedagogical reasons, that's fine — just keep
+the choice consistent within that course. In all cases:
+
 - **Commands, flags, code, file paths, technical terms:** English, always.
-
-✅ "Faylga `rwx` huquqini berish uchun `chmod 755 script.sh` buyrug'ini ishlating."
-❌ "Faylga o'qish-yozish-bajarish huquqini berish uchun fayl-rejimini-o'zgartirish 755 buyrug'ini ishlating."
+- **Prose:** English by default; mixed/Uzbek only if the course owner deliberately chooses it.
 
 ### Don't translate command names
 `chmod`, `kubectl`, `systemctl`, `apt`, `iptables`, `ssh`, `git` — they keep their original spelling.

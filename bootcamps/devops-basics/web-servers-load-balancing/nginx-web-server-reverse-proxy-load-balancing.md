@@ -15,6 +15,7 @@ By end of lesson student can:
 - Configure nginx as a load balancer across multiple backends, using different balancing methods
 - Install certbot, generate a Let's Encrypt certificate, and operate certbot's day-2 commands (renew, revoke, delete, certificates)
 - Configure the `stream` module as a full Layer 4 (TCP/UDP) proxy and load balancer, independent of HTTP
+- Explain how HAProxy differs from nginx as a load balancer, and configure a basic HAProxy frontend/backend with active health checks
 
 ## Topics
 
@@ -27,6 +28,7 @@ By end of lesson student can:
 - `stream` module as a full TCP/UDP-level proxy: `stream` context, `upstream`, `server`, `proxy_pass`, `listen ... udp`, use cases (MySQL proxy, generic TCP load balancer, non-HTTP protocols)
 - certbot: installing certbot and its nginx plugin, generating a Let's Encrypt certificate (`certbot --nginx`, `certbot certonly`), HTTP→HTTPS redirect, certificate auto-renewal (systemd timer)
 - certbot day-2 commands: `certificates`, `renew`, `renew --dry-run`, `revoke`, `delete`, `--expand`
+- HAProxy: installing, config structure (`global`, `defaults`, `frontend`, `backend`), balancing algorithms, active health checks, comparison with nginx
 
 ## Concepts
 
@@ -190,6 +192,32 @@ Common uses:
 
 `stream` supports its own `upstream` blocks with the same load-balancing methods (round-robin, `least_conn`, and a stream-specific `hash` for consistent routing) — conceptually the same load-balancing model as `http`'s `upstream`, just operating below the HTTP layer.
 
+### HAProxy: a dedicated load balancer
+
+HAProxy (High Availability Proxy) is software built from the ground up specifically to do one job extremely well: load balancing and proxying, at both Layer 4 (TCP) and Layer 7 (HTTP). Where nginx is primarily a web server that also load-balances well, HAProxy is primarily a load balancer — it has no concept of `root`/`index`/serving static files at all. In practice, many production stacks use nginx to serve/proxy application traffic and HAProxy in front of it (or in front of database clusters) specifically for its more advanced traffic-distribution and health-checking features.
+
+HAProxy's config file (`/etc/haproxy/haproxy.cfg`) is organized into distinct sections, each with a specific role:
+
+| Section | Purpose |
+|---|---|
+| `global` | Process-wide settings: user/group to run as, max connections, logging target |
+| `defaults` | Shared settings inherited by every `frontend`/`backend` below, unless overridden |
+| `frontend` | Where HAProxy listens for incoming traffic — bind address/port, and rules for which `backend` to send traffic to |
+| `backend` | A pool of servers HAProxy distributes traffic across, plus the balancing algorithm and health-check settings |
+| `listen` | A shortcut combining `frontend` + `backend` into one section, for simple single-purpose proxies |
+
+A `frontend` defines `mode http` (Layer 7 — HAProxy parses HTTP, can route on headers/paths, like nginx's `location`) or `mode tcp` (Layer 4 — raw byte forwarding, like nginx's `stream`). This single config format handling both modes, in one tool, is one of HAProxy's key differences from nginx, which splits this across the separate `http` and `stream` contexts.
+
+Balancing algorithms are set with `balance` inside a `backend`:
+
+| Algorithm | Behavior |
+|---|---|
+| `roundrobin` | Same idea as nginx's default — even rotation across servers |
+| `leastconn` | Route to the server with fewest active connections (nginx's `least_conn`) |
+| `source` | Same client IP always routed to the same server (nginx's `ip_hash` equivalent) |
+
+Where HAProxy differs most noticeably from nginx's out-of-the-box behavior is **active health checking**: adding `check` to a `server` line tells HAProxy to proactively probe that backend on a regular interval (not just reactively count failures from real traffic, as nginx's `max_fails` does) — a backend can be detected and pulled out of rotation before it ever serves a single failed real request. HAProxy also ships a built-in **stats page** (enabled via a `listen stats` section) showing live per-backend health, connection counts, and traffic — useful for a quick visual view of load-balancer state without external tooling.
+
 ## Commands / Syntax Reference
 
 | Command | Purpose | Example |
@@ -207,6 +235,9 @@ Common uses:
 | `certbot renew --dry-run` | Test renewal without actually renewing | `sudo certbot renew --dry-run` |
 | `certbot revoke` | Invalidate a certificate | `sudo certbot revoke --cert-path /etc/letsencrypt/live/example.com/cert.pem` |
 | `certbot delete` | Remove a managed certificate | `sudo certbot delete --cert-name example.com` |
+| `haproxy -c -f` | Check HAProxy config syntax | `sudo haproxy -c -f /etc/haproxy/haproxy.cfg` |
+| `systemctl reload haproxy` | Reload HAProxy config | `sudo systemctl reload haproxy` |
+| `systemctl status haproxy` | Check HAProxy service status | `sudo systemctl status haproxy` |
 
 ## Examples / Walkthrough
 
@@ -416,6 +447,72 @@ sudo systemctl reload nginx
 ss -tuln | grep -E ":3306|:5000"        # confirm nginx itself is now listening on both ports
 ```
 
+```bash
+# --- installing HAProxy ---
+sudo apt update
+sudo apt install haproxy
+systemctl status haproxy
+sudo systemctl enable haproxy
+```
+
+```
+# --- /etc/haproxy/haproxy.cfg: HTTP load balancing with active health checks ---
+global
+    log /dev/log local0
+    maxconn 2000
+    user haproxy
+    group haproxy
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+    log global
+
+frontend web_front
+    bind *:80
+    default_backend web_back
+
+backend web_back
+    balance roundrobin
+    option httpchk GET /healthz          # active health check: HAProxy itself sends this request
+    server app1 10.0.0.11:3000 check
+    server app2 10.0.0.12:3000 check
+    server app3 10.0.0.13:3000 check weight 2 backup
+
+# built-in stats page — live view of backend health and traffic, protect with auth in production
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+```
+
+```bash
+# always check syntax before reloading — same discipline as nginx -t
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+sudo systemctl reload haproxy
+
+curl -I http://lb.example.com                # confirm traffic reaches a backend
+# visit http://<server-ip>:8404/stats in a browser to see live backend status
+```
+
+```
+# --- TCP mode: HAProxy in front of a database pool (Layer 4, like nginx's stream) ---
+frontend mysql_front
+    bind *:3306
+    mode tcp
+    default_backend mysql_back
+
+backend mysql_back
+    mode tcp
+    balance leastconn
+    option tcp-check                     # active TCP-level health check (just confirms the port accepts a connection)
+    server db1 10.0.0.21:3306 check
+    server db2 10.0.0.22:3306 check
+```
+
 ## Common Pitfalls
 
 - **Reloading without testing first** — `sudo systemctl reload nginx` (or `nginx -s reload`) with a syntax error in the config can take the whole server down. Always run `sudo nginx -t` first; it catches syntax errors before they reach production traffic.
@@ -428,6 +525,9 @@ ss -tuln | grep -E ":3306|:5000"        # confirm nginx itself is now listening 
 - **`client_max_body_size` defaulting to 1MB** — file uploads that "just fail" with no obvious backend error are very often nginx silently rejecting the request body before it even reaches the backend. Explicitly set `client_max_body_size` in any server block expecting uploads.
 - **Forgetting `proxy_http_version 1.1` and clearing `Connection` when using `keepalive` in an `upstream`** — the `keepalive` directive alone does nothing without also setting `proxy_http_version 1.1;` and `proxy_set_header Connection "";` in the matching `location` block; without both, nginx still closes each backend connection after one request.
 - **Requesting a certbot certificate before DNS propagates** — Let's Encrypt's HTTP validation makes a real request to the domain; if `dig <domain> A` doesn't yet return this server's IP, issuance fails, sometimes counting against Let's Encrypt's rate limits if retried too aggressively.
+- **Forgetting `mode http`/`mode tcp` mismatches in HAProxy** — a `frontend` and its `default_backend` must agree on mode; mixing an `http` frontend with a `tcp` backend (or vice versa) fails config validation. Set `mode` explicitly in both, or rely on a shared `defaults mode` only when every section in the file genuinely uses the same mode.
+- **Exposing the HAProxy stats page without authentication** — `listen stats` with no `stats auth` line is reachable by anyone who can reach that port, and reveals backend IPs, traffic patterns, and health status. Add `stats auth user:password` (or restrict access at the firewall level, Lesson 11) before running this in anything beyond a lab.
+- **Assuming HAProxy's `check` happens automatically** — a `server` line without the `check` keyword is never actively health-checked at all; HAProxy just assumes it's always up. Forgetting `check` silently disables the exact feature (active health checking) that's the main reason to reach for HAProxy over nginx's passive `max_fails`.
 
 ## FAQ
 
@@ -455,6 +555,12 @@ A: Both request and obtain the certificate from Let's Encrypt the same way. `--n
 **Q: Do I need `max_fails`/`fail_timeout` if my backends are already healthy?**
 A: Not strictly — nginx will still load-balance fine without them. They matter once a backend actually fails: without them, nginx keeps sending some requests to a dead backend indefinitely, causing errors for whichever clients get routed there, instead of temporarily routing around it.
 
+**Q: Why would I add HAProxy in front of nginx instead of just using nginx's own load balancing?**
+A: nginx's passive health checking (`max_fails`) only reacts after real traffic already failed against a bad backend. HAProxy's active `check` proactively probes backends on its own schedule, so it can pull a failing backend out of rotation before a real user request ever hits it. HAProxy's config also unifies HTTP and TCP load balancing in one file/tool, and its stats page gives an at-a-glance operational view nginx doesn't provide out of the box. For many stacks, nginx alone is plenty; HAProxy earns its place when health-check precision or a dedicated stats view matters.
+
+**Q: Is HAProxy a replacement for nginx?**
+A: Not typically — they're often complementary rather than competing. nginx serves static files and reverse-proxies application traffic; HAProxy specializes in distributing that traffic across many backend instances with fine-grained health checking. A common pattern is HAProxy in front of a pool of nginx instances, or HAProxy in front of a database cluster where nginx's `stream` module would otherwise be used.
+
 ## Practice / Exercise
 
 **Core:**
@@ -472,9 +578,16 @@ A: Not strictly — nginx will still load-balance fine without them. They matter
 3. Set up a `stream` block proxying a TCP service (any simple TCP listener works for practice), plus a second `stream` server block proxying a UDP service, and confirm connectivity through nginx with a basic client tool for each.
 4. Enable `keepalive` on an `upstream` (with the required `proxy_http_version 1.1` and cleared `Connection` header) and explain, in your own words, what problem it solves.
 5. Write a `location` block using `try_files` to fall back to a custom `404.html` page, and test it against both an existing and a non-existing file.
+6. Install HAProxy on a lab VM, configure a `frontend`/`backend` pair load-balancing across your 2-3 practice backends from exercise 5 above, with `option httpchk` and `check` on each server. Validate with `haproxy -c -f` before reloading.
+7. Enable the HAProxy `listen stats` section, protect it with `stats auth`, and view live backend health/traffic from the stats page in a browser.
+
+**Stretch (continued):**
+6. Stop one backend HAProxy is checking and observe, via the stats page, how quickly HAProxy detects the failure and stops routing to it — compare this against how nginx's `max_fails` would have behaved for the same failure.
+7. Configure an HAProxy `backend` in `mode tcp` proxying a raw TCP service, and compare its config shape against the equivalent nginx `stream` block from exercise 3.
 
 ## Further Reading
 
 - [nginx documentation](https://nginx.org/en/docs/)
 - [nginx: Reverse Proxy Guide](https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/)
 - [Certbot documentation](https://certbot.eff.org/)
+- [HAProxy documentation](https://www.haproxy.org/#docs)

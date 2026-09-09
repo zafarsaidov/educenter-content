@@ -7,23 +7,37 @@
 ## Learning Objectives
 
 By end of lesson student can:
+- Install nginx from the official package and from the official nginx repository, and explain why the latter is often preferred
 - Explain nginx's event-driven architecture and where its config files live
-- Write and validate an nginx server block serving static content
+- Write and validate an nginx server block serving static content, using the most common directives correctly
+- Explain how nginx picks a `location` block when several could match the same URL
 - Configure nginx as a reverse proxy in front of a backend application
 - Configure nginx as a load balancer across multiple backends, using different balancing methods
-- Enable HTTPS with `certbot` and set up automatic certificate renewal
-- Explain the `stream` module and when TCP/UDP proxying is needed instead of HTTP proxying
+- Install certbot, generate a Let's Encrypt certificate, and operate certbot's day-2 commands (renew, revoke, delete, certificates)
+- Configure the `stream` module as a full Layer 4 (TCP/UDP) proxy and load balancer, independent of HTTP
 
 ## Topics
 
-- nginx overview: event-driven architecture, config structure (`/etc/nginx/nginx.conf`, `sites-available/enabled`), `nginx -t`, `systemctl reload`
-- Server blocks: `listen`, `server_name`, `root`, `index`, `location` blocks, `try_files`, custom error pages
-- Reverse proxy: `proxy_pass`, `proxy_set_header` (`Host`, `X-Real-IP`, `X-Forwarded-For`), `proxy_read_timeout`, `proxy_connect_timeout`
-- Load balancing: `upstream` block with multiple backends; methods: round-robin (default), `ip_hash`, `least_conn`; `weight` parameter
-- HTTPS with certbot: install certbot, `certbot --nginx`, certificate auto-renewal (systemd timer), HTTP→HTTPS redirect
-- Stream module: TCP/UDP proxying (`stream` block, `upstream`, `server`); use cases: MySQL proxy, TCP load balancer
+- Installing nginx: `apt` package vs official nginx repository, verifying the install, default paths
+- nginx overview: event-driven architecture, config structure (`/etc/nginx/nginx.conf`, `sites-available/enabled`, `conf.d/`), `nginx -t`, `systemctl reload`
+- Most used server-block directives: `listen`, `server_name`, `root`, `index`, `access_log`/`error_log`, `client_max_body_size`, `keepalive_timeout`, `gzip`
+- `location` blocks in depth: prefix match, exact match (`=`), regex match (`~`, `~*`), matching priority order, `try_files`, custom error pages
+- Reverse proxy: `proxy_pass`, `proxy_set_header` (`Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`), `proxy_read_timeout`, `proxy_connect_timeout`, `proxy_buffering`
+- Load balancing: `upstream` block with multiple backends; methods: round-robin (default), `ip_hash`, `least_conn`; `weight` parameter; passive health checks (`max_fails`, `fail_timeout`)
+- `stream` module as a full TCP/UDP-level proxy: `stream` context, `upstream`, `server`, `proxy_pass`, `listen ... udp`, use cases (MySQL proxy, generic TCP load balancer, non-HTTP protocols)
+- certbot: installing certbot and its nginx plugin, generating a Let's Encrypt certificate (`certbot --nginx`, `certbot certonly`), HTTP→HTTPS redirect, certificate auto-renewal (systemd timer)
+- certbot day-2 commands: `certificates`, `renew`, `renew --dry-run`, `revoke`, `delete`, `--expand`
 
 ## Concepts
+
+### Installing nginx
+
+Two common install paths on Ubuntu:
+
+- **`apt install nginx`** — installs whatever version is in Ubuntu's default repositories. Simple, but that version can lag well behind upstream nginx releases, since Ubuntu prioritizes stability over freshness.
+- **Official nginx repository** — adds nginx's own APT repository (with its own GPG signing key, same mechanism as the PPAs covered in Lesson 7) so `apt install nginx` pulls current upstream releases instead. Preferred when you need recent features, faster security patches, or a specific nginx version.
+
+Either way, the package installs the same layout and registers nginx as a systemd service, so `systemctl start/enable/status nginx` (Lesson 5) works immediately after install. `nginx -v` prints the installed version; `nginx -V` (capital V) additionally prints the exact compile-time flags and modules built in — useful for confirming whether the `stream` module is available, since on some minimal builds it's compiled as a separate package.
 
 ### Why nginx, and its architecture
 
@@ -59,6 +73,46 @@ A `server` block defines how nginx handles requests for one site/domain. Key dir
 
 Multiple `server` blocks can share one nginx instance, each handling a different `server_name` (name-based virtual hosting) — nginx picks the matching block based on the request's `Host` header.
 
+Beyond the basics above, a handful of directives show up in nearly every real config:
+
+| Directive | Purpose |
+|---|---|
+| `access_log` | Path (or `off`) for the request log — default logs every request with timing/status |
+| `error_log` | Path and minimum severity level for error logging |
+| `client_max_body_size` | Largest request body nginx accepts (e.g. file uploads); default is only 1MB, a very common source of unexplained upload failures |
+| `keepalive_timeout` | How long an idle client connection is kept open for reuse, reducing TCP handshake overhead on repeat requests |
+| `gzip` / `gzip_types` | Enables response compression, and which MIME types to compress — cuts bandwidth for text-based responses (HTML/CSS/JS/JSON) |
+| `return` | Short-circuit a response without proxying, e.g. `return 301 https://$host$request_uri;` for a redirect |
+
+### `location` block matching in depth
+
+A `server` block can contain many `location` blocks, each matching a different URL path pattern. When a request comes in, nginx doesn't just use the first match it finds — it follows a strict priority order:
+
+1. **Exact match** — `location = /path` — matches only that literal path, nothing else. Checked first; if it matches, nginx stops immediately.
+2. **Prefix match with `^~`** — `location ^~ /static/` — matches any path starting with `/static/`; if this wins, nginx skips regex checks entirely.
+3. **Regex match** — `location ~ /pattern` (case-sensitive) or `location ~* /pattern` (case-insensitive) — checked in the order they appear in the config; the first matching regex wins.
+4. **Plain prefix match** — `location /path` (no modifier) — the longest matching prefix wins if no regex or `^~` block matched.
+
+```nginx
+location = /healthz {          # 1. exact match, fastest, checked first
+    return 200 "ok";
+}
+
+location ^~ /static/ {         # 2. prefix match, skips regex checks if matched
+    root /var/www;
+}
+
+location ~* \.(jpg|png|gif)$ { # 3. case-insensitive regex, checked in file order
+    expires 30d;
+}
+
+location / {                   # 4. plain prefix fallback, matches everything else
+    proxy_pass http://app_backend;
+}
+```
+
+Getting this order backwards (e.g. assuming top-to-bottom always wins) is one of the most common sources of "why is this location block being ignored" confusion.
+
 ### Reverse proxy
 
 A **reverse proxy** sits in front of one or more backend application servers and forwards client requests to them, then returns the backend's response to the client — the client only ever talks to nginx, never directly to the backend. `proxy_pass` inside a `location` block is what forwards the request.
@@ -70,12 +124,26 @@ Because the backend now sees the connection as coming from nginx (not the real c
 | `Host` | Preserves the original requested hostname |
 | `X-Real-IP` | The real client's IP address |
 | `X-Forwarded-For` | Chain of proxy IPs the request passed through (useful when there's more than one hop) |
+| `X-Forwarded-Proto` | Whether the original client request was `http` or `https` — without it, a backend behind an HTTPS-terminating nginx would wrongly believe every request arrived as plain HTTP |
 
-`proxy_connect_timeout` and `proxy_read_timeout` control how long nginx waits when establishing a connection to the backend, and while waiting for the backend to respond, respectively — tuning these avoids either failing too aggressively on a slow-but-working backend, or hanging too long on a genuinely dead one.
+`proxy_connect_timeout` and `proxy_read_timeout` control how long nginx waits when establishing a connection to the backend, and while waiting for the backend to respond, respectively — tuning these avoids either failing too aggressively on a slow-but-working backend, or hanging too long on a genuinely dead one. `proxy_buffering` (on by default) controls whether nginx buffers the backend's response in memory/disk before sending it to the client — turning it `off` streams the response through immediately, which matters for things like long-lived streaming responses or Server-Sent Events, at the cost of holding the backend connection open longer.
 
-### Load balancing
+### Load balancing and the `upstream` block
 
-An `upstream` block names a pool of backend servers that requests can be distributed across; `proxy_pass` then references the upstream's name instead of a single backend address.
+An `upstream` block names a pool of backend servers that requests can be distributed across; `proxy_pass` then references the upstream's name instead of a single backend address. It's a top-level block (a sibling of `server {}`, inside `http {}`), so one `upstream` can be referenced by multiple `server` blocks if needed.
+
+Beyond a bare `server` line per backend, each `server` entry inside `upstream` accepts several useful parameters:
+
+| Parameter | Effect |
+|---|---|
+| `weight=N` | Proportionally more requests to this backend (covered below) |
+| `max_fails=N` | Consecutive failures before this backend is marked unavailable |
+| `fail_timeout=T` | How long a failed backend stays marked unavailable, and the window failures are counted over |
+| `backup` | Only receives traffic if all non-backup servers are unavailable — a standby |
+| `down` | Marks a backend permanently out of rotation (e.g. during planned maintenance), without deleting the line |
+| `max_conns=N` | Caps concurrent connections nginx will send to this one backend |
+
+`upstream` also supports a `keepalive N;` directive, which keeps a pool of already-open connections to backends ready for reuse instead of opening a fresh TCP connection per request — meaningfully reduces latency and backend load under high traffic (requires `proxy_http_version 1.1;` and clearing the `Connection` header in the matching `location` block to take effect).
 
 | Method | Behavior |
 |---|---|
@@ -84,29 +152,113 @@ An `upstream` block names a pool of backend servers that requests can be distrib
 | `ip_hash` | Same client IP is always routed to the same backend — useful when a backend keeps session state in memory (sticky sessions) |
 | `least_conn` | New requests go to whichever backend currently has the fewest active connections — useful when requests take varying amounts of time to process |
 
-### HTTPS with certbot
+nginx also does basic **passive health checking** on upstream backends out of the box: `max_fails` sets how many consecutive failed attempts mark a backend as unavailable, and `fail_timeout` sets both how long it stays marked unavailable and the window over which failures are counted. `server 10.0.0.11:3000 max_fails=3 fail_timeout=30s;` stops sending traffic to a backend after 3 failures within 30 seconds, then retries it after that window — no external health-check tooling required for this basic case.
 
-`certbot` automates obtaining and installing free TLS certificates from Let's Encrypt. `certbot --nginx` specifically integrates with nginx: it detects your existing server blocks, requests a certificate for the matching domain, and edits the nginx config itself to add the `listen 443 ssl` directive, certificate paths, and (optionally) a redirect from HTTP to HTTPS.
+### HTTPS with certbot: installing and generating certificates
 
-Let's Encrypt certificates are short-lived (90 days), so certbot also installs a **systemd timer** (Lesson 5's territory) that periodically checks and renews certificates automatically before they expire — no manual renewal needed once set up.
+`certbot` automates obtaining and installing free TLS certificates from Let's Encrypt, a certificate authority that issues domain-validated certificates at no cost. Installation on Ubuntu is via `apt` — either the `certbot` package plus the `python3-certbot-nginx` plugin (which lets certbot edit nginx config directly), from the standard repositories or, for a more current version, Certbot's own recommended `snap` install (Lesson 7's `snap` package manager).
 
-### The `stream` module
+Two main ways to generate a certificate:
 
-Everything above operates in nginx's `http` context — it understands HTTP requests, headers, and paths. The `stream` module is a separate context that proxies raw **TCP/UDP** traffic without any HTTP-layer awareness — nginx just forwards bytes between client and backend. This is needed for protocols that aren't HTTP at all: proxying/load-balancing a MySQL database (port 3306), or generic TCP load balancing where you want nginx's connection-distribution logic but the traffic isn't a web request.
+- **`certbot --nginx -d example.com`** — the integrated flow: certbot reads your existing nginx server block for that domain, requests the certificate, then edits the nginx config itself to add `listen 443 ssl`, the certificate file paths, and (optionally, if you confirm) a redirect from HTTP to HTTPS. Best when nginx is already configured and running for that domain.
+- **`certbot certonly --nginx -d example.com`** — obtains the certificate the same way, but does **not** edit the nginx config — it only places the certificate files on disk. Useful when you want to write the `listen 443 ssl` block yourself, or when a domain's config isn't ready for certbot to touch automatically.
+
+Either way, Let's Encrypt validates domain ownership before issuing anything — it makes an HTTP request to the domain (or a DNS challenge, for advanced cases) to confirm you actually control it, which is why DNS must already point at the server before requesting a certificate. Certificates issued this way are short-lived (90 days), so certbot also installs a **systemd timer** (Lesson 5's territory) that runs the renewal check twice daily and renews any certificate nearing expiry — no manual renewal needed once set up.
+
+### certbot day-2 commands
+
+Beyond the initial issuance, certbot exposes commands for the certificate's whole lifecycle:
+
+| Command | Purpose |
+|---|---|
+| `certbot certificates` | List every certificate certbot manages, with domains, paths, and expiry dates |
+| `certbot renew` | Renew any certificate within 30 days of expiry (this is what the automated timer calls) |
+| `certbot renew --dry-run` | Simulate the renewal process without actually requesting a new certificate — safe to run anytime, doesn't count against Let's Encrypt's rate limits |
+| `certbot revoke --cert-path <path>` | Invalidate a certificate before its expiry (e.g. after a suspected key compromise) |
+| `certbot delete --cert-name <domain>` | Remove a certificate and its renewal configuration entirely |
+| `certbot --nginx -d example.com --expand` | Add additional domains/subdomains to an existing certificate |
+
+### The `stream` module as a full Layer 4 proxy
+
+Everything above (`server`, `location`, `proxy_pass` for HTTP) operates in nginx's `http` context — it parses HTTP requests, headers, and paths. The `stream` module is a completely separate top-level context that proxies raw **TCP and UDP** traffic at Layer 4, with zero awareness of what's inside the packets — nginx just forwards bytes between client and backend as fast as possible. This is what makes it a *general-purpose* TCP/UDP proxy and load balancer, not just an HTTP tool: it works for any protocol, not only ones nginx understands.
+
+Common uses:
+
+- Proxying/load-balancing a database (e.g. MySQL on port 3306, PostgreSQL on 5432) across replicas
+- Generic TCP load balancing for a custom application protocol that isn't HTTP at all
+- UDP proxying (`listen 3306 udp;`) for protocols like DNS or some game/streaming protocols
+
+`stream` supports its own `upstream` blocks with the same load-balancing methods (round-robin, `least_conn`, and a stream-specific `hash` for consistent routing) — conceptually the same load-balancing model as `http`'s `upstream`, just operating below the HTTP layer.
 
 ## Commands / Syntax Reference
 
 | Command | Purpose | Example |
 |---|---|---|
+| `nginx -v` / `-V` | Print version / version + compiled modules | `nginx -V` |
 | `nginx -t` | Test config syntax | `sudo nginx -t` |
 | `nginx -s reload` | Reload config (alt to systemctl) | `sudo nginx -s reload` |
 | `systemctl reload nginx` | Graceful config reload | `sudo systemctl reload nginx` |
 | `systemctl status nginx` | Check service status | `sudo systemctl status nginx` |
 | `ln -s` | Enable a site (symlink) | `sudo ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/` |
-| `certbot --nginx` | Obtain + install a certificate | `sudo certbot --nginx -d example.com` |
+| `certbot --nginx` | Obtain + install + auto-edit nginx config | `sudo certbot --nginx -d example.com` |
+| `certbot certonly --nginx` | Obtain certificate only, no config edits | `sudo certbot certonly --nginx -d example.com` |
+| `certbot certificates` | List managed certificates + expiry | `sudo certbot certificates` |
+| `certbot renew` | Renew certificates nearing expiry | `sudo certbot renew` |
 | `certbot renew --dry-run` | Test renewal without actually renewing | `sudo certbot renew --dry-run` |
+| `certbot revoke` | Invalidate a certificate | `sudo certbot revoke --cert-path /etc/letsencrypt/live/example.com/cert.pem` |
+| `certbot delete` | Remove a managed certificate | `sudo certbot delete --cert-name example.com` |
 
 ## Examples / Walkthrough
+
+```bash
+# --- installing nginx ---
+
+# option 1: default Ubuntu repository (simple, may lag behind upstream releases)
+sudo apt update
+sudo apt install nginx
+
+# option 2: official nginx repository (current upstream releases)
+sudo apt install curl gnupg2 ca-certificates lsb-release
+curl -fsSL https://nginx.org/keys/nginx_signing.key | sudo gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
+  | sudo tee /etc/apt/sources.list.d/nginx.list
+sudo apt update
+sudo apt install nginx
+
+# verify install
+nginx -v                                # version only
+nginx -V                                # version + compile flags/modules (check for --with-stream)
+systemctl status nginx                  # confirm the systemd service is running
+sudo systemctl enable nginx             # start automatically on boot
+```
+
+```nginx
+# --- location matching priority demo ---
+server {
+    listen 80;
+    server_name demo.example.com;
+    root /var/www/demo;
+
+    location = /healthz {              # 1. exact match — checked first, fastest
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    location ^~ /static/ {             # 2. prefix match with ^~, skips regex checks
+        root /var/www;
+        expires 7d;
+    }
+
+    location ~* \.(jpg|jpeg|png|gif|css|js)$ {   # 3. case-insensitive regex
+        expires 30d;
+        access_log off;                # don't bother logging static asset hits
+    }
+
+    location / {                       # 4. plain prefix fallback
+        try_files $uri $uri/ =404;
+    }
+}
+```
 
 ```nginx
 # --- /etc/nginx/sites-available/static-site: serving static files ---
@@ -157,13 +309,16 @@ server {
 # --- /etc/nginx/sites-available/app-lb: load balancing across 3 backends ---
 upstream app_backend {
     # default: round-robin across all three
-    server 10.0.0.11:3000;
-    server 10.0.0.12:3000;
+    server 10.0.0.11:3000 max_fails=3 fail_timeout=30s;
+    server 10.0.0.12:3000 max_fails=3 fail_timeout=30s;
     server 10.0.0.13:3000 weight=2;        # gets ~2x the requests of the others
+    server 10.0.0.14:3000 backup;          # only used if all above are unavailable
 
     # alternative balancing methods (pick one, comment out the others):
     # ip_hash;                             # sticky sessions by client IP
     # least_conn;                          # route to backend with fewest active connections
+
+    keepalive 32;                          # keep up to 32 idle connections open per worker, for reuse
 }
 
 server {
@@ -172,46 +327,93 @@ server {
 
     location / {
         proxy_pass http://app_backend;
+        proxy_http_version 1.1;            # required for keepalive to backends to work
+        proxy_set_header Connection "";     # clear the default "close", allow connection reuse
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
 
 ```bash
-# --- HTTPS with certbot ---
+# --- installing certbot ---
 sudo apt update
 sudo apt install certbot python3-certbot-nginx    # certbot + its nginx plugin
 
+# confirm DNS already points at this server before requesting anything (Lesson 10's dig)
+dig app.example.com A
+
+# --- generating a Let's Encrypt certificate ---
+
+# option 1: integrated flow — certbot edits the nginx config for you
 sudo certbot --nginx -d app.example.com
 # certbot: detects the matching server block, requests a certificate, edits the config to add
-# "listen 443 ssl", certificate paths, and offers to add an HTTP -> HTTPS redirect
+# "listen 443 ssl", certificate paths, and offers to add an HTTP -> HTTPS redirect (choose yes)
+
+# option 2: certificate only, no config edits — write the ssl block yourself
+sudo certbot certonly --nginx -d app.example.com
 
 sudo nginx -t                                      # confirm certbot's edits are valid
 sudo systemctl reload nginx
 
+curl -I https://app.example.com                    # confirm HTTPS responds
+curl -I http://app.example.com                      # confirm HTTP redirects (look for 301 Location: https://...)
+
+# --- certbot day-2 commands ---
+sudo certbot certificates                          # list every managed cert, domains, expiry dates
+
 # renewal is automated via a systemd timer installed by certbot; confirm it exists:
 systemctl list-timers | grep certbot
 
-# test the renewal process without actually renewing (safe, doesn't use up rate limits)
-sudo certbot renew --dry-run
+sudo certbot renew --dry-run                        # simulate renewal, safe, doesn't hit rate limits
+sudo certbot renew                                   # actually renew anything within 30 days of expiry
+
+# add another subdomain to an existing certificate
+sudo certbot --nginx -d app.example.com -d www.app.example.com --expand
+
+# revoke and remove a certificate no longer needed
+sudo certbot revoke --cert-path /etc/letsencrypt/live/app.example.com/cert.pem
+sudo certbot delete --cert-name app.example.com
 ```
 
 ```nginx
-# --- stream module: TCP load balancing, e.g. for MySQL (port 3306) ---
-# this block goes in /etc/nginx/nginx.conf, at the top level (NOT inside http {})
+# --- stream module: full Layer 4 (TCP/UDP) proxy and load balancer ---
+# this block goes directly in /etc/nginx/nginx.conf, at the top level (NOT inside http {})
 stream {
+    # TCP example: load-balance a MySQL replica pool
     upstream mysql_backend {
-        server 10.0.0.21:3306;
-        server 10.0.0.22:3306;
+        least_conn;
+        server 10.0.0.21:3306 max_fails=2 fail_timeout=15s;
+        server 10.0.0.22:3306 max_fails=2 fail_timeout=15s;
     }
 
     server {
         listen 3306;
         proxy_pass mysql_backend;
+        proxy_connect_timeout 5s;
+        proxy_timeout 300s;              # stream's equivalent of proxy_read_timeout
+    }
+
+    # UDP example: proxy a UDP-based service (e.g. a custom protocol on port 5000)
+    upstream udp_backend {
+        server 10.0.0.31:5000;
+        server 10.0.0.32:5000;
+    }
+
+    server {
+        listen 5000 udp;                 # "udp" keyword is what makes this Layer 4 UDP, not TCP
+        proxy_pass udp_backend;
     }
 }
+```
+
+```bash
+# after adding/editing a stream block, always test before reloading — same discipline as http config
+sudo nginx -t
+sudo systemctl reload nginx
+ss -tuln | grep -E ":3306|:5000"        # confirm nginx itself is now listening on both ports
 ```
 
 ## Common Pitfalls
@@ -222,6 +424,10 @@ stream {
 - **Confusing `restart` and `reload`** — `systemctl restart nginx` drops all active connections; `systemctl reload nginx` applies config changes gracefully without interrupting in-flight requests. Prefer `reload` for routine config changes.
 - **Running `certbot --nginx` before the domain's DNS actually points at the server** — Let's Encrypt validates domain ownership by making an HTTP request to the domain; if DNS isn't yet pointing at this nginx instance, certificate issuance fails. Confirm `dig <domain> A` (Lesson 10) resolves to the right IP first.
 - **Putting a `stream` block inside `http {}`** — `stream` is a separate top-level context alongside `http` in `nginx.conf`, not nested inside it; nginx will fail to start if it's misplaced.
+- **Assuming `location` blocks match top-to-bottom** — nginx actually applies a fixed priority order (exact match, then `^~` prefix, then regex in file order, then longest plain prefix), not simple top-to-bottom. A `location /` at the top of the file does not "win" over a more specific block further down.
+- **`client_max_body_size` defaulting to 1MB** — file uploads that "just fail" with no obvious backend error are very often nginx silently rejecting the request body before it even reaches the backend. Explicitly set `client_max_body_size` in any server block expecting uploads.
+- **Forgetting `proxy_http_version 1.1` and clearing `Connection` when using `keepalive` in an `upstream`** — the `keepalive` directive alone does nothing without also setting `proxy_http_version 1.1;` and `proxy_set_header Connection "";` in the matching `location` block; without both, nginx still closes each backend connection after one request.
+- **Requesting a certbot certificate before DNS propagates** — Let's Encrypt's HTTP validation makes a real request to the domain; if `dig <domain> A` doesn't yet return this server's IP, issuance fails, sometimes counting against Let's Encrypt's rate limits if retried too aggressively.
 
 ## FAQ
 
@@ -240,19 +446,32 @@ A: Practically yes — certbot installs a systemd timer that checks twice daily 
 **Q: Why would I need the `stream` module instead of just proxying HTTP normally?**
 A: `proxy_pass` in the `http` context understands and manipulates HTTP requests — but many protocols nginx might need to load-balance (raw database connections, custom TCP protocols) aren't HTTP at all. `stream` operates purely at the TCP/UDP level, just forwarding bytes, which works for any protocol regardless of what's inside the packets.
 
+**Q: Should I install nginx via `apt` or the official nginx repository?**
+A: Plain `apt install nginx` is simplest and fine for learning/most use cases. Add the official nginx repository when you need a more current version than Ubuntu ships, faster access to security patches, or specific modules — the install/config workflow is identical either way, only the package source differs.
+
+**Q: What's the actual difference between `certbot --nginx` and `certbot certonly --nginx`?**
+A: Both request and obtain the certificate from Let's Encrypt the same way. `--nginx` (without `certonly`) additionally edits your nginx config automatically to serve HTTPS with it. `certonly` only places the certificate files on disk under `/etc/letsencrypt/live/` and leaves your nginx config untouched — use it when you'd rather write the `ssl` directives yourself.
+
+**Q: Do I need `max_fails`/`fail_timeout` if my backends are already healthy?**
+A: Not strictly — nginx will still load-balance fine without them. They matter once a backend actually fails: without them, nginx keeps sending some requests to a dead backend indefinitely, causing errors for whichever clients get routed there, instead of temporarily routing around it.
+
 ## Practice / Exercise
 
 **Core:**
-1. Install nginx on a lab VM, create a static site under `/var/www/`, write a server block for it, enable it via the `sites-enabled` symlink, and verify with `nginx -t` before reloading.
-2. Run a simple backend app (or a basic HTTP server, e.g. `python3 -m http.server 3000`) and write a reverse-proxy server block pointing at it, including all three proxy headers.
-3. Run 2-3 instances of a simple backend on different ports, set up an `upstream` block with default round-robin, and confirm requests distribute across them (e.g. by having each instance return its own port number in the response).
-4. Change the `upstream` block to use `least_conn`, then `ip_hash`, and explain the difference you'd expect to observe in each mode.
-5. If you have a real domain pointed at a lab server, run `certbot --nginx` and confirm HTTPS works and HTTP redirects to HTTPS.
+1. Install nginx on a lab VM (try both the `apt` package and, separately if time allows, the official nginx repository), confirm the version and compiled modules with `nginx -v`/`nginx -V`.
+2. Create a static site under `/var/www/`, write a server block for it, enable it via the `sites-enabled` symlink, and verify with `nginx -t` before reloading.
+3. Build the 4-block `location` priority demo (exact `/healthz`, `^~ /static/`, regex for image extensions, plain `/` fallback) and confirm each one matches the request you expect it to, in the right priority order.
+4. Run a simple backend app (or a basic HTTP server, e.g. `python3 -m http.server 3000`) and write a reverse-proxy server block pointing at it, including all four proxy headers (`Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`).
+5. Run 2-3 instances of a simple backend on different ports, set up an `upstream` block with default round-robin, and confirm requests distribute across them (e.g. by having each instance return its own port number in the response).
+6. Change the `upstream` block to use `least_conn`, then `ip_hash`, and explain the difference you'd expect to observe in each mode.
+7. If you have a real domain pointed at a lab server, install certbot, generate a certificate with `certbot --nginx`, and confirm HTTPS works and HTTP redirects to HTTPS. Then run `certbot certificates` and `certbot renew --dry-run`.
 
 **Stretch:**
 1. Add a `weight` to one backend in your load-balanced upstream and send enough requests to confirm it receives proportionally more traffic.
-2. Set up a `stream` block proxying a TCP service (any simple TCP listener works for practice) and confirm connectivity through nginx with a basic client tool.
-3. Write a `location` block using `try_files` to fall back to a custom `404.html` page, and test it against both an existing and a non-existing file.
+2. Add `max_fails`/`fail_timeout` to your upstream, stop one backend, and confirm nginx stops routing to it and later retries it.
+3. Set up a `stream` block proxying a TCP service (any simple TCP listener works for practice), plus a second `stream` server block proxying a UDP service, and confirm connectivity through nginx with a basic client tool for each.
+4. Enable `keepalive` on an `upstream` (with the required `proxy_http_version 1.1` and cleared `Connection` header) and explain, in your own words, what problem it solves.
+5. Write a `location` block using `try_files` to fall back to a custom `404.html` page, and test it against both an existing and a non-existing file.
 
 ## Further Reading
 

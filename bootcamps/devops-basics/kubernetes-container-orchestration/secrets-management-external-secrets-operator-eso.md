@@ -2,7 +2,7 @@
 
 **Module:** Kubernetes – Container Orchestration
 **Duration:** 120-150 min
-**Prerequisites:** Lessons 34-42 (cluster architecture, kubectl, Pods/Deployments, Services, Ingress, PV/PVC, ConfigMaps and native Secrets). Student can create a native Secret, consume it as env var or file, and read `kubectl describe` output. A Vault server is **pre-configured** by the instructor; students do not install or initialise Vault in this lesson.
+**Prerequisites:** Lessons 34-42 (cluster architecture, kubectl, Pods/Deployments, Services, Ingress, PV/PVC, ConfigMaps and native Secrets). Student can create a native Secret, consume it as env var or file, and read `kubectl describe` output. In class a Vault server is **pre-configured** by the instructor; the lesson also shows how to deploy your own **dev-mode** Vault for a home lab.
 
 ## Learning Objectives
 
@@ -11,7 +11,8 @@ By end of lesson student can:
 - Explain the External Secrets Operator architecture: controller, webhook, cert-controller and the CRDs `SecretStore`, `ClusterSecretStore`, `ExternalSecret`
 - Explain the data flow: Vault -> ESO controller -> native Secret -> Pod
 - Describe Vault KV v2 and the Kubernetes auth method (policy, role, ServiceAccount token login) at concept level
-- Write a `SecretStore` for the Vault provider using ServiceAccount (Kubernetes auth) and AppRole auth
+- Deploy a throw-away Vault in **dev mode** on the cluster and configure KV v2, a policy, Kubernetes auth and AppRole auth on it
+- Write a `SecretStore` for the Vault provider using ServiceAccount (Kubernetes auth) and AppRole auth, and explain when to use each
 - Decide between `SecretStore` (namespaced) and `ClusterSecretStore` (cluster-wide)
 - Write an `ExternalSecret` with `data` (key mapping), `dataFrom` (pull all keys), `refreshInterval`, `secretStoreRef` and `target`
 - Verify sync with `kubectl get externalsecret`, `describe`, status conditions, and decode the resulting Secret
@@ -22,6 +23,7 @@ By end of lesson student can:
 - Why ESO: limitations of native K8s Secrets (base64, etcd, no rotation)
 - ESO architecture: operator, SecretStore, ClusterSecretStore, ExternalSecret CRDs
 - Pre-configured Vault: KV v2 engine, Kubernetes auth method (concept walkthrough)
+- Lab Vault: deploying Vault in dev mode (Helm), enabling KV v2, Kubernetes auth and AppRole auth (dev only)
 - SecretStore: Vault provider config, auth (serviceAccount token, approle)
 - ExternalSecret: data mapping, refreshInterval, secretStoreRef; verify secret sync
 
@@ -187,6 +189,42 @@ For systems that cannot present a ServiceAccount token (other clusters, CI, VMs)
 - **role_id** – like a username, not very secret
 - **secret_id** – like a password, secret, can be single-use/TTL-bound
 
+```
+1. Admin creates role "eso-approle" with policy "myapp-read" and reads its role_id
+2. Admin generates a secret_id for that role (optionally TTL-bound / limited uses)
+3. secret_id is stored once in a native Secret in the cluster; role_id goes into the SecretStore YAML
+4. ESO -> Vault:  POST /v1/auth/approle/login   { role_id: "...", secret_id: "..." }
+5. Vault checks the pair and role limits -> issues Vault token with policy "myapp-read"
+6. ESO uses the Vault token to read secret/data/myapp/db
+```
+
+Admin-side setup, instructor reference (the dev-mode lab below runs it for real):
+
+```bash
+vault auth enable approle
+
+vault write auth/approle/role/eso-approle \
+    token_policies=myapp-read \
+    token_ttl=1h \
+    token_max_ttl=4h \
+    secret_id_ttl=0 \
+    secret_id_num_uses=0
+
+vault read -field=role_id auth/approle/role/eso-approle/role-id
+vault write -f -field=secret_id auth/approle/role/eso-approle/secret-id
+```
+
+Role parameters worth knowing:
+
+| Parameter | Meaning |
+|---|---|
+| `token_policies` | Policies attached to tokens issued by this role |
+| `token_ttl` / `token_max_ttl` | Lifetime of the Vault token ESO receives; ESO logs in again when it expires |
+| `secret_id_ttl` | How long a generated `secret_id` stays valid. `0` = never expires (lab only); production: short TTL + rotation |
+| `secret_id_num_uses` | `0` = unlimited. `1` = single-use, which a long-lived controller cannot use, so not suitable for ESO |
+| `secret_id_bound_cidrs` / `token_bound_cidrs` | Restrict logins to given source IPs (e.g. the cluster egress range) |
+| `bind_secret_id` | `true` by default; keep it, otherwise `role_id` alone logs in |
+
 ESO stores `secret_id` in a native Secret and references it; ESO sends both to `auth/approle/login`. Trade-off: AppRole needs one **bootstrap secret** in the cluster (the `secret_id`), Kubernetes auth needs none. Prefer Kubernetes auth when Vault can reach the cluster API; use AppRole otherwise.
 
 | | Kubernetes auth | AppRole |
@@ -196,6 +234,119 @@ ESO stores `secret_id` in a native Secret and references it; ESO sends both to `
 | Rotation burden | None | Rotate secret_id |
 | Needs Vault -> cluster API connectivity | Yes (TokenReview) | No |
 | Best for | In-cluster ESO | Cross-cluster, CI, no API reachability |
+
+### Deploying Vault in dev mode (lab setup)
+
+Use this to get a working Vault on your own cluster (kind, minikube, home lab) so every command in this lesson can actually be run. **Dev mode is for learning only.**
+
+| Dev mode property | Consequence |
+|---|---|
+| In-memory storage | Everything (secrets, policies, auth config) is **lost when the Pod restarts** |
+| Auto-initialised and auto-unsealed | No unseal keys, no seal management shown |
+| Fixed root token (`root`) | Anyone who can reach Vault is admin |
+| Plain HTTP on :8200, no TLS | Traffic is readable on the network |
+| KV v2 pre-mounted at `secret/` | Convenient, but real clusters must enable it explicitly |
+
+Never use dev mode for real secrets. Production Vault uses persistent storage (Raft/Consul), TLS, real unseal/auto-unseal, and no root token in daily use.
+
+#### Install with Helm
+
+Helm is taught fully in lessons 53-55; here it is only an installer.
+
+```bash
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo update
+
+helm install vault hashicorp/vault \
+  --namespace vault --create-namespace \
+  --set "server.dev.enabled=true" \
+  --set "injector.enabled=false"
+
+kubectl -n vault get pods
+# NAME      READY   STATUS    RESTARTS   AGE
+# vault-0   1/1     Running   0          30s
+```
+
+`injector.enabled=false` skips the sidecar injector, which ESO does not need. The Service is `vault.vault.svc:8200`, the same address the `SecretStore` examples use. The chart also creates the `vault` ServiceAccount and a ClusterRoleBinding to `system:auth-delegator`; that binding lets Vault call the Kubernetes TokenReview API for Kubernetes auth.
+
+Alternative without Helm (one Pod, same dev server):
+
+```bash
+kubectl create namespace vault
+kubectl -n vault run vault --image=hashicorp/vault:1.17 \
+  --env=VAULT_DEV_ROOT_TOKEN_ID=root \
+  --env=VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+  --port=8200 -- vault server -dev
+kubectl -n vault expose pod vault --port=8200
+```
+
+With this variant the Pod is named `vault` (not `vault-0`) and has no auth-delegator binding, so Kubernetes auth needs extra RBAC. Prefer the Helm install for this lesson.
+
+#### Configure the lab Vault
+
+All admin commands run **inside the Vault Pod**, logged in with the dev root token:
+
+```bash
+kubectl -n vault exec -it vault-0 -- sh
+
+export VAULT_ADDR=http://127.0.0.1:8200
+export VAULT_TOKEN=root
+vault status                       # Sealed false, Storage Type inmem
+vault secrets list                 # secret/ is type kv, version 2
+```
+
+Create the demo secret, policy and both auth methods:
+
+```bash
+# 1. data
+vault kv put secret/myapp/db username=appuser password='S3cr3t-DemoOnly'
+
+# 2. policy
+vault policy write myapp-read - <<'EOF'
+path "secret/data/myapp/*"     { capabilities = ["read"] }
+path "secret/metadata/myapp/*" { capabilities = ["list", "read"] }
+EOF
+
+# 3. Kubernetes auth
+vault auth enable kubernetes
+vault write auth/kubernetes/config \
+    kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR:443"
+vault write auth/kubernetes/role/eso-role \
+    bound_service_account_names=vault-auth \
+    bound_service_account_namespaces=demo,external-secrets \
+    policies=myapp-read \
+    ttl=1h
+
+# 4. AppRole auth
+vault auth enable approle
+vault write auth/approle/role/eso-approle \
+    token_policies=myapp-read token_ttl=1h token_max_ttl=4h
+vault read  -field=role_id   auth/approle/role/eso-approle/role-id
+vault write -f -field=secret_id auth/approle/role/eso-approle/secret-id
+
+exit
+```
+
+Notes:
+- `$KUBERNETES_PORT_443_TCP_ADDR` is an environment variable Kubernetes injects into every Pod; it holds the API server ClusterIP. Because the command runs inside the Vault Pod, Vault also finds the cluster CA and its own ServiceAccount token automatically, so no `token_reviewer_jwt` or `kubernetes_ca_cert` is needed.
+- `bound_service_account_namespaces=demo,external-secrets` covers a namespaced `SecretStore` in `demo` and a `ClusterSecretStore` whose ServiceAccount lives in `external-secrets`.
+- Copy the printed `role_id` into the AppRole `SecretStore` and the `secret_id` into the bootstrap Secret (next section).
+- Lesson 44's lab expects a secret at `secret/lab44/postgres`. If you reuse this Vault there, write it too: `vault kv put secret/lab44/postgres username=postgres password='Lab44-DemoOnly'`, and add `secret/data/lab44/*` to the policy.
+
+#### Reach Vault from your laptop (optional)
+
+```bash
+kubectl -n vault port-forward svc/vault 8200:8200
+# another terminal
+export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
+vault kv get secret/myapp/db
+```
+
+The UI is at http://127.0.0.1:8200 (sign in with method Token, value `root`).
+
+#### Reset and cleanup
+
+Dev mode forgets everything on restart. After `kubectl -n vault delete pod vault-0`, re-run the configuration block **and generate a new `secret_id`** (the old one no longer exists). Remove the lab Vault with `helm -n vault uninstall vault` and `kubectl delete namespace vault`.
 
 ### Installing ESO
 
@@ -219,7 +370,7 @@ Expected: three Pods Running (controller, webhook, cert-controller) and CRDs suc
 #### Kubernetes auth (ServiceAccount)
 
 ```yaml
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
   name: vault-backend
@@ -256,7 +407,7 @@ A `SecretStore` is **namespaced**: SA `vault-auth` must exist in namespace `demo
 #### ClusterSecretStore variant
 
 ```yaml
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: ClusterSecretStore
 metadata:
   name: vault-global
@@ -281,6 +432,9 @@ Differences: `kind`, no `metadata.namespace`, `serviceAccountRef.namespace` is m
 
 #### AppRole auth
 
+Use when Vault cannot reach the cluster API for TokenReview, or ESO runs in a different cluster than Vault's Kubernetes auth is bound to. Prerequisite: the Vault-side role from the AppRole section above (role `eso-approle`, policy `myapp-read`) and its `role_id` / `secret_id`.
+
+
 ```bash
 # bootstrap Secret holding the secret_id (value comes from Vault admin; placeholder here)
 kubectl -n demo create secret generic vault-approle \
@@ -288,7 +442,7 @@ kubectl -n demo create secret generic vault-approle \
 ```
 
 ```yaml
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
   name: vault-approle-backend
@@ -306,6 +460,58 @@ spec:
           secretRef:
             name: "vault-approle"            # Secret holding secret_id
             key: "secret-id"
+```
+
+| Field | Meaning | Common mistake |
+|---|---|---|
+| `auth.appRole.path` | Mount path of the AppRole auth method | Custom mount (`approle-prod`) not matched |
+| `auth.appRole.roleId` | The role_id, as plain text | Copying the role *name* instead of the UUID |
+| `auth.appRole.roleRef` | Alternative: read role_id from a Secret/ConfigMap instead of inline | Setting both `roleId` and `roleRef` |
+| `auth.appRole.secretRef` | Secret + key holding the secret_id | Key name mismatch (`secret-id` vs `secret_id`) |
+
+`ClusterSecretStore` variant: `secretRef` must also name a `namespace`, because the store itself has none:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: vault-approle-global
+spec:
+  provider:
+    vault:
+      server: "http://vault.vault.svc:8200"
+      path: "secret"
+      version: "v2"
+      auth:
+        appRole:
+          path: "approle"
+          roleId: "11111111-2222-3333-4444-555555555555"   # placeholder
+          secretRef:
+            name: "vault-approle"
+            key: "secret-id"
+            namespace: "external-secrets"                  # REQUIRED for cluster-scoped
+```
+
+Check the login works before building ExternalSecrets on top:
+
+```bash
+kubectl -n demo get secretstore vault-approle-backend
+# NAME                    AGE   STATUS   CAPABILITIES   READY
+# vault-approle-backend   5s    Valid    ReadWrite      True
+```
+
+`ExternalSecret` objects work the same; only `secretStoreRef.name` changes to `vault-approle-backend`.
+
+Rotating the `secret_id` (do this on a schedule in production):
+
+```bash
+# 1. in Vault: issue a new secret_id
+vault write -f -field=secret_id auth/approle/role/eso-approle/secret-id
+# 2. in the cluster: replace the bootstrap Secret
+kubectl -n demo create secret generic vault-approle \
+  --from-literal=secret-id='NEW-SECRET-ID' --dry-run=client -o yaml | kubectl apply -f -
+# 3. ESO uses the new value on its next login; confirm the store is still Valid
+# 4. in Vault: revoke the old secret_id via its accessor (auth/approle/role/eso-approle/secret-id-accessor/destroy)
 ```
 
 #### Checking a store
@@ -326,7 +532,7 @@ An `ExternalSecret` says: *"using store X, fetch these remote values, and keep a
 #### Anatomy
 
 ```yaml
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
   name: myapp-db
@@ -553,7 +759,7 @@ kubectl -n demo create serviceaccount vault-auth
 
 ```bash
 cat <<'EOF' | kubectl apply -f -
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
   name: vault-backend
@@ -581,7 +787,7 @@ Expect `STATUS Valid`, `READY True`. If not, `kubectl -n demo describe secretsto
 
 ```bash
 cat <<'EOF' | kubectl apply -f -
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
   name: myapp-db
@@ -666,7 +872,7 @@ kubectl -n demo get secret myapp-db-secret
 
 ```bash
 cat <<'EOF' | kubectl apply -f -
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
   name: myapp-all
@@ -703,7 +909,53 @@ kubectl -n demo patch externalsecret myapp-all --type merge \
   -p '{"spec":{"dataFrom":[{"extract":{"key":"myapp/db"}}]}}'
 ```
 
-### Step 11: Cleanup
+### Step 11: Switch to AppRole auth
+
+Assumes the AppRole from the lab-setup section exists in Vault. Use the real `role_id` and `secret_id` you printed.
+
+```bash
+ROLE_ID='<role_id from vault read>'
+SECRET_ID='<secret_id from vault write -f>'
+
+kubectl -n demo create secret generic vault-approle \
+  --from-literal=secret-id="$SECRET_ID"
+
+cat <<EOF | kubectl apply -f -
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: vault-approle-backend
+  namespace: demo
+spec:
+  provider:
+    vault:
+      server: "http://vault.vault.svc:8200"
+      path: "secret"
+      version: "v2"
+      auth:
+        appRole:
+          path: "approle"
+          roleId: "$ROLE_ID"
+          secretRef:
+            name: "vault-approle"
+            key: "secret-id"
+EOF
+
+kubectl -n demo get secretstore vault-approle-backend      # expect Valid / True
+```
+
+Point the ExternalSecret at the new store and watch it re-sync:
+
+```bash
+kubectl -n demo patch externalsecret myapp-db --type merge \
+  -p '{"spec":{"secretStoreRef":{"name":"vault-approle-backend"}}}'
+kubectl -n demo annotate externalsecret myapp-db force-sync=$(date +%s) --overwrite
+kubectl -n demo get externalsecret myapp-db                # SecretSynced / True
+```
+
+Break it on purpose: put a wrong value into the bootstrap Secret and observe `invalid role or secret ID` on the store.
+
+### Step 12: Cleanup
 
 ```bash
 kubectl delete namespace demo
@@ -723,6 +975,11 @@ kubectl delete namespace demo
 | Secret exists but values stale | `refreshInterval` long or `0` | Lower interval or force-sync annotation |
 | App still has old password after rotation | Env var consumption | Restart Pod, or mount as volume |
 | Secret already existed, ESO will not touch it | Existing Secret not owned by ESO | Delete it (ESO recreates), or use `creationPolicy: Merge` |
+| SecretStore (AppRole) `invalid role or secret ID` | Wrong `roleId`, wrong/expired `secret_id`, or Vault Pod restarted (dev mode) | Re-read `role_id`, mint a new `secret_id`, update the Secret |
+| SecretStore (AppRole) key not found in Secret | `secretRef.key` does not match the key in the Secret | `kubectl -n demo get secret vault-approle -o jsonpath='{.data}'` |
+| SecretStore (AppRole) `permission denied` on `auth/approle/login` | AppRole not enabled or different mount `path` | `vault auth list`; match `auth.appRole.path` |
+| `no matches for kind "SecretStore" in version "external-secrets.io/v1beta1"` | Old manifest, newer ESO | Change apiVersion to `external-secrets.io/v1` |
+| Vault `connection refused` or lab config gone | Dev-mode Pod restarted, data in memory only | Re-run the configure block and mint a new `secret_id` |
 | `x509: certificate signed by unknown authority` | Vault uses private CA | Add `caProvider`/`caBundle` to store |
 | CRD not found on `apply` | Chart installed without CRDs | Reinstall with `installCRDs=true` |
 | Webhook error `failed calling webhook` on apply | cert-controller/webhook Pod not ready | `kubectl -n external-secrets get pods`, wait |
@@ -743,7 +1000,7 @@ Debug order: **Store Valid? -> ExternalSecret conditions -> path/property vs `va
 - **Committing real credentials, `secret_id` or Vault tokens** — only reference-only YAML belongs in Git.
 - **Using a `ClusterSecretStore` with a broad Vault policy** — every namespace can then request everything that policy allows. Narrow the policy and add `conditions`.
 - **Assuming ESO removes etcd exposure** — the Secret still lives in etcd; combine with etcd encryption and RBAC.
-- **Pinning the apiVersion wrong** — use `external-secrets.io/v1beta1` (or `v1` on newer releases); check `kubectl api-resources --api-group=external-secrets.io` and `kubectl explain`.
+- **Using an old apiVersion** — manifests in this lesson use `external-secrets.io/v1`. Older tutorials show `external-secrets.io/v1beta1`; that version is deprecated and removed in newer releases (`no matches for kind "SecretStore" in version "external-secrets.io/v1beta1"`). Check what your cluster serves: `kubectl api-resources --api-group=external-secrets.io` and `kubectl explain secretstore --api-version=external-secrets.io/v1`. Upgrade the chart if `v1` is missing.
 
 ## FAQ
 
@@ -824,7 +1081,7 @@ Environment: pre-configured Vault, ESO installed, namespace of your own (`studen
 1. Replace `data` with `dataFrom.extract` and compare the Secret keys.
 2. Use `target.template` to build `DATABASE_URL` from `DB_USER` and `DB_PASSWORD`.
 3. Create a `ClusterSecretStore` with `conditions.namespaces` limited to your namespace; reference it from an `ExternalSecret` using `kind: ClusterSecretStore`; show that another namespace is refused.
-4. Switch the store to AppRole auth (instructor supplies role_id and secret_id); compare the bootstrap burden with Kubernetes auth.
+4. Switch the store to AppRole auth (use your lab Vault's `role_id` and a freshly minted `secret_id`); compare the bootstrap burden with Kubernetes auth. Then rotate the `secret_id` and confirm the store stays `Valid`.
 5. Pin `remoteRef.version` to an older KV version and show the old value comes back.
 6. Set `creationPolicy: Orphan`, delete the ExternalSecret, show the Secret remains; clean it up.
 7. Mount the Secret as a volume instead of env, rotate in Vault, and watch the file change without a Pod restart (allow about a minute).
